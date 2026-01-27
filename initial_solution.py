@@ -8,92 +8,103 @@ import time
 from model import Instance, Parameters
 from evaluate import evaluate_solution
 from solution import Solution
-   
+
+
 def create_initial_solution(instance: Instance, params: Parameters) -> Solution:
     """Create initial solution using nearest neighbor heuristic"""
     sol = Solution(instance, params)
 
     # Separate customers by type
-    delivery_customers = [c.id for c in instance.customers if c.type in ['D']]
-    pickup_customers = [(c.id, c.pair_id) for c in instance.customers if c.type == 'P']
+    delivery_only = [c.id for c in instance.customers if c.type == "D"]
+    pickup_delivery_pairs = []
 
-    # Create pickup-delivery pairs
-    pd_pairs = {}
-    for p_id, pair_id in pickup_customers:
-        delivery_id = None
-        for c in instance.customers:
-            if c.type == 'DL' and c.pair_id == pair_id:
-                delivery_id = c.id
-                break
-        if delivery_id:
-            pd_pairs[p_id] = delivery_id
+    # Build P-DL pairs
+    for p_id, dl_id in instance.pd_pairs.items():
+        pickup_delivery_pairs.append((p_id, dl_id))
 
-    # Distribute customers to trucks using round-robin
-    all_customers = delivery_customers + [p for p, _ in pickup_customers]
-    random.shuffle(all_customers)
-
-    for i, cust_id in enumerate(all_customers):
+    # Distribute delivery-only customers to trucks using round-robin
+    random.shuffle(delivery_only)
+    for i, cust_id in enumerate(delivery_only):
         truck_id = i % params.num_trucks
         sol.truck_routes[truck_id].append(cust_id)
 
-        # If pickup, add corresponding delivery
-        if cust_id in pd_pairs:
-            sol.truck_routes[truck_id].append(pd_pairs[cust_id])
+    # Distribute P-DL pairs to trucks
+    random.shuffle(pickup_delivery_pairs)
+    for i, (p_id, dl_id) in enumerate(pickup_delivery_pairs):
+        truck_id = i % params.num_trucks
+        # Add pickup first, then delivery (maintaining precedence)
+        sol.truck_routes[truck_id].append(p_id)
+        sol.truck_routes[truck_id].append(dl_id)
 
     # Optimize each route with nearest neighbor
     for truck_id in range(params.num_trucks):
-        sol.truck_routes[truck_id] = nearest_neighbor_route(
-            sol.truck_routes[truck_id], instance
-        )
+        if sol.truck_routes[truck_id]:
+            sol.truck_routes[truck_id] = nearest_neighbor_route(
+                sol.truck_routes[truck_id], instance
+            )
 
     sol.makespan = evaluate_solution(sol)
     return sol
 
+
 def nearest_neighbor_route(customers: List[int], instance: Instance) -> List[int]:
-    """Optimize route using nearest neighbor"""
+    """Optimize route using nearest neighbor while respecting P-DL precedence"""
     if len(customers) <= 1:
         return customers
-
-    # Build route respecting pickup-delivery constraints
-    pd_pairs = {}
-    for c in instance.customers:
-        if c.type == 'P':
-            for c2 in instance.customers:
-                if c2.type == 'DL' and c2.pair_id == c.pair_id:
-                    pd_pairs[c.id] = c2.id
 
     route = []
     unvisited = set(customers)
     current = 0  # start from depot
 
+    # Track pickup-delivery pairs
+    pickup_done = set()
+
     while unvisited:
-        # Find nearest unvisited customer
         nearest = None
-        min_dist = float('inf')
+        min_dist = float("inf")
 
         for cust_id in unvisited:
-            # Check if pickup-delivery constraint satisfied
             cust = instance.customers[cust_id - 1]
-            if cust.type == 'DL':
-                pickup_id = None
-                for c in instance.customers:
-                    if c.type == 'P' and c.pair_id == cust.pair_id:
-                        pickup_id = c.id
-                        break
-                if pickup_id and pickup_id in unvisited:
-                    continue  # skip delivery if pickup not done
 
+            # Check precedence constraint for DL customers
+            if cust.type == "DL":
+                # Find corresponding pickup
+                pickup_id = None
+                for p_id, d_id in instance.pd_pairs.items():
+                    if d_id == cust_id:
+                        pickup_id = p_id
+                        break
+
+                # Skip DL if pickup not done yet
+                if pickup_id and pickup_id in unvisited:
+                    continue
+
+            # Calculate distance
             dist = instance.dist_matrix[current][cust_id]
-            if dist < min_dist:
-                min_dist = dist
+
+            # Prefer customers with earlier ready times (tie-breaker)
+            penalty = 0
+            if cust.type in ["D", "DL"]:
+                penalty = cust.ready_time * 0.01  # Small penalty for later ready times
+
+            adjusted_dist = dist + penalty
+
+            if adjusted_dist < min_dist:
+                min_dist = adjusted_dist
                 nearest = cust_id
 
         if nearest is None:
-            # No valid customer, pick any
+            # Should not happen if logic is correct
             nearest = list(unvisited)[0]
 
         route.append(nearest)
         unvisited.remove(nearest)
+
+        # Mark pickup as done
+        cust = instance.customers[nearest - 1]
+        if cust.type == "P":
+            pickup_done.add(cust.pair_id)
+
         current = nearest
 
     return route
